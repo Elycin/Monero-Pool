@@ -7,7 +7,8 @@ using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using StackExchange.Redis;
+using HttpListener = Mono.Net.HttpListener;
+using HttpListenerContext = Mono.Net.HttpListenerContext;
 
 namespace MoneroPool
 {
@@ -16,65 +17,77 @@ namespace MoneroPool
         public CryptoNightPool()
         {
             Logger.Log(Logger.LogLevel.Debug, "CryptoNightPool declared");
-
         }
 
         public async Task HttpServer()
         {
-            Mono.Net.HttpListener listener = new Mono.Net.HttpListener();
-            listener.Prefixes.Add(Statics.Config.IniReadValue("http-server"));
+            var listener = new HttpListener();
+            listener.Prefixes.Add(Program.Configuration.IniReadValue("http-server"));
             listener.Start();
             while (true)
             {
-                Mono.Net.HttpListenerContext client = await listener.GetContextAsync();
-                if (Statics.RedisDb.Bans.Any(x => x.IpBan == client.Request.UserHostAddress))
+                var client = await listener.GetContextAsync();
+                if (Program.RedisPoolDatabase.Bans.Any(x => x.IpBan == client.Request.UserHostAddress))
                 {
-                    Ban ban = Statics.RedisDb.Bans.First(x => x.IpBan == client.Request.UserHostAddress);
+                    var ban = Program.RedisPoolDatabase.Bans.First(x => x.IpBan == client.Request.UserHostAddress);
                     if ((DateTime.Now - ban.Begin).Minutes > ban.Minutes)
                     {
                         AcceptHttpClient(client);
-                        Statics.RedisDb.Remove(ban);
+                        Program.RedisPoolDatabase.Remove(ban);
                     }
                     else
                     {
                         Logger.Log(Logger.LogLevel.General, "Reject ban client from ip {0}",
-                                   client.Request.UserHostAddress);
+                            client.Request.UserHostAddress);
                     }
                 }
                 else
+                {
                     AcceptHttpClient(client);
+                }
             }
         }
 
+        /// <summary>
+        ///  Start the pool socket server.
+        /// </summary>
+        /// <returns></returns>
         public async Task TcpServer()
         {
-
-            TcpListener listener = new TcpListener(IPAddress.Any,
-                                                   int.Parse(Statics.Config.IniReadValue("stratum-server-port")));
+            // Start the socket server.
+            var listener = new TcpListener(IPAddress.Any, Program.Configuration.GetStratumPort());
             listener.Start();
+
+            // Continious loop
             while (true)
             {
-                TcpClient client = await listener.AcceptTcpClientAsync();
-                if (
-                    Statics.RedisDb.Bans.Any(
-                        x => x.IpBan == ((IPEndPoint) client.Client.RemoteEndPoint).Address.ToString()))
+                // Asyncronously accept connections.
+                var connectedMiner = await listener.AcceptTcpClientAsync();
+
+                // Check if banned.
+                if (Program.RedisPoolDatabase.Bans.Any(x => x.IpBan == connectedMiner.Client.RemoteEndPoint.Address)
                 {
-                    Ban ban =
-                        Statics.RedisDb.Bans.First(
-                            x => x.IpBan == ((IPEndPoint) client.Client.RemoteEndPoint).Address.ToString());
+                    // The user is banned - Get the information about the ban.
+                    var ban = Program.RedisPoolDatabase.Bans.First(x =>
+                        x.IpBan == ((IPEndPoint) connectedMiner.Client.RemoteEndPoint).Address.ToString());
+
+                    // Compare the ban time to see if 
                     if ((DateTime.Now - ban.Begin).Minutes > ban.Minutes)
                     {
-                        AcceptTcpClient(client);
-                        Statics.RedisDb.Remove(ban);
+                        AcceptTcpClient(connectedMiner);
+                        Program.RedisPoolDatabase.Remove(ban);
                     }
                     else
                     {
-                        Logger.Log(Logger.LogLevel.General, "Reject ban client from ip {0}",
-                                   ((IPEndPoint) client.Client.RemoteEndPoint).Address.ToString());
+                        Logger.Log(Logger.LogLevel.General, "Banned address attempted to connect: {0}",
+                            connectedMiner.Client.RemoteEndPoint);
                     }
                 }
                 else
-                    AcceptTcpClient(client);
+                {
+                    // No ban detected.
+                    AcceptTcpClient(connectedMiner);
+                }
             }
         }
 
@@ -89,64 +102,62 @@ namespace MoneroPool
 
         public void IncreaseShareCount(string guid, uint difficulty)
         {
-            ConnectedWorker worker = Statics.ConnectedClients[guid];
-            double shareValue = (double) difficulty/
-                                int.Parse(Statics.Config.IniReadValue("base-difficulty"));
+            var currentWorker = Program.ConnectedClients[guid];
+            var shareValue = difficulty / Program.Configuration.GetBaseDifficulty();
 
-            Block block;
-            if (Statics.RedisDb.Blocks.Any(x => x.BlockHeight == Statics.CurrentBlockHeight))
+            // Get the current block height.
+            Block block = Program.RedisPoolDatabase.Blocks.Any(x => x.BlockHeight == Program.CurrentBlockHeight)
+                ? Program.RedisPoolDatabase.Blocks.First(x => x.BlockHeight == Program.CurrentBlockHeight)
+                : new Block(Program.CurrentBlockHeight);
+
+            // Get the current miner's addrerss.
+            Miner miner = Program.RedisPoolDatabase.Miners.Any(x => x.Address == currentWorker.Address)
+                ? Program.RedisPoolDatabase.Miners.First(x => x.Address == currentWorker.Address)
+                : new Miner(currentWorker.Address, 0);
+
+            // Iterate through each block reward.
+            foreach (var fBlockReward in Program.RedisPoolDatabase.BlockRewards)
             {
-                block = Statics.RedisDb.Blocks.First(x => x.BlockHeight == Statics.CurrentBlockHeight);
-            }
-            else
-            {
-                block = new Block(Statics.CurrentBlockHeight);
-            }
-            Miner miner;
-            if (Statics.RedisDb.Miners.Any(x => x.Address == worker.Address))
-            {
-                miner = Statics.RedisDb.Miners.First(x => x.Address == worker.Address);
-            }
-            else
-            {
-                miner = new Miner(worker.Address, 0);
-            }
-            foreach (var fBlockReward in Statics.RedisDb.BlockRewards)
-            {
+                // Check if the current block.
                 if (fBlockReward.Block == block.Identifier && fBlockReward.Miner == miner.Identifier)
                 {
-                    Share fShare = new Share(fBlockReward.Identifier, shareValue);
+                    var fShare = new Share(fBlockReward.Identifier, shareValue);
                     fBlockReward.Shares.Add(fShare.Identifier);
 
-                    Statics.RedisDb.SaveChanges(fBlockReward);
-                    Statics.RedisDb.SaveChanges(fShare);
-                    Statics.RedisDb.SaveChanges(miner);
-                    Statics.RedisDb.SaveChanges(block);
+                    // Save changes to the redis database.
+                    Program.RedisPoolDatabase.SaveChanges(fBlockReward);
+                    Program.RedisPoolDatabase.SaveChanges(fShare);
+                    Program.RedisPoolDatabase.SaveChanges(miner);
+                    Program.RedisPoolDatabase.SaveChanges(block);
+
+                    // Return so we stop burning cycles.
                     return;
                 }
             }
 
-            BlockReward blockReward = new BlockReward(miner.Identifier, block.Identifier);
-            Share share = new Share(blockReward.Identifier, shareValue);
+            // Get the block reward and current share.
+            var blockReward = new BlockReward(miner.Identifier, block.Identifier);
+            var share = new Share(blockReward.Identifier, shareValue);
+
+            // Track the data in proper lists.
             blockReward.Shares.Add(share.Identifier);
-
             miner.BlockReward.Add(blockReward.Identifier);
-
             block.BlockRewards.Add(blockReward.Identifier);
 
-            Statics.RedisDb.SaveChanges(blockReward);
-            Statics.RedisDb.SaveChanges(share);
-            Statics.RedisDb.SaveChanges(miner);
-            Statics.RedisDb.SaveChanges(block);
+            // Save all data to the redis database.
+            Program.RedisPoolDatabase.SaveChanges(blockReward);
+            Program.RedisPoolDatabase.SaveChanges(share);
+            Program.RedisPoolDatabase.SaveChanges(miner);
+            Program.RedisPoolDatabase.SaveChanges(block);
         }
 
         public bool GenerateSubmitResponse(ref JObject response, string jobId, string guid, byte[] nonce,
-                                           string resultHash, string ipAddress)
+            string resultHash, string ipAddress)
         {
-            ConnectedWorker worker = Statics.ConnectedClients[guid];
+            var worker = Statics.ConnectedClients[guid];
 
-            Statics.TotalShares++;
-            JObject result = new JObject();
+            Program.TotalShares++;
+            var result = new JObject();
 
             if (nonce == null || nonce.Length == 0)
             {
@@ -156,23 +167,27 @@ namespace MoneroPool
 
             try
             {
-                ShareJob shareJob = worker.JobSeed.First(x => x.Key == jobId).Value;
+                var shareJob = worker.JobSeed.First(x => x.Key == jobId).Value;
                 if (!shareJob.SubmittedShares.Contains(BitConverter.ToInt32(nonce, 0)))
+                {
                     shareJob.SubmittedShares.Add(BitConverter.ToInt32(nonce, 0));
+                }
                 else
                 {
                     response["error"] = "Duplicate share";
                     return false;
                 }
-                int jobSeed = shareJob.Seed;
+
+                var jobSeed = shareJob.Seed;
                 worker.ShareRequest(shareJob.CurrentDifficulty);
-                Statics.RedisDb.MinerWorkers.First(x => x.Identifier == guid).ShareRequest(shareJob.CurrentDifficulty);
-                byte[] prevJobBlock = Helpers.GenerateShareWork(jobSeed, true);
+                Program.RedisPoolDatabase.MinerWorkers.First(x => x.Identifier == guid)
+                    .ShareRequest(shareJob.CurrentDifficulty);
+                var prevJobBlock = Helpers.GenerateShareWork(jobSeed, true);
 
                 Array.Copy(nonce, 0, prevJobBlock, 39, nonce.Length);
-                byte[] blockHash = Hash.CryptoNight(prevJobBlock);
+                var blockHash = Hash.CryptoNight(prevJobBlock);
 
-                Statics.ConnectedClients[guid].LastSeen = DateTime.Now;
+                Program.ConnectedClients[guid].LastSeen = DateTime.Now;
 
                 if (resultHash.ToUpper() != BitConverter.ToString(blockHash).Replace("-", ""))
                 {
@@ -183,19 +198,26 @@ namespace MoneroPool
                 }
                 else
                 {
+                    var shareProcess = Helpers.ProcessShare(
+                        blockHash,
+                        (int) Program.CurrentBlockTemplate["difficulty"],
+                        (uint) shareJob.CurrentDifficulty
+                    );
 
-                    ShareProcess shareProcess =
-                        Helpers.ProcessShare(blockHash, (int) Statics.CurrentBlockTemplate["difficulty"],
-                                             (uint) shareJob.CurrentDifficulty);
-
-                    string address = Statics.ConnectedClients[guid].Address;
+                    // Get the current address for the miner.
+                    var address = Program.ConnectedClients[guid].Address;
 
                     worker.TotalShares++;
 
                     if (shareProcess == ShareProcess.ValidShare || shareProcess == ShareProcess.ValidBlock)
                     {
-                        Statics.HashRate.Difficulty += (uint) shareJob.CurrentDifficulty;
-                        Statics.HashRate.Time = (ulong) ((DateTime.Now - Statics.HashRate.Begin).TotalSeconds);
+                        // Increment the difficulty by the current share.
+                        Program.HashRate.Difficulty += (uint) shareJob.CurrentDifficulty;
+
+                        // Incrememtn the time by the epoch.
+                        Program.HashRate.Time = (ulong) (DateTime.Now - Program.HashRate.Begin).TotalSeconds;
+
+                        // Try to increase the share count.
                         try
                         {
                             IncreaseShareCount(guid, (uint) shareJob.CurrentDifficulty);
@@ -205,60 +227,88 @@ namespace MoneroPool
                             Logger.Log(Logger.LogLevel.Error, e.ToString());
                             throw;
                         }
+
+                        // Check to see if we've found a block.
                         if (shareProcess == ShareProcess.ValidBlock &&
-                            !Statics.BlocksPendingSubmition.Any(x => x.BlockHeight == worker.CurrentBlock))
+                            !Program.BlocksPendingSubmition.Any(x => x.BlockHeight == worker.CurrentBlock))
                         {
                             Logger.Log(Logger.LogLevel.Special, "Block found by {0}", guid);
-                            byte[] shareWork = Helpers.GenerateShareWork(jobSeed, false);
+                            var shareWork = Helpers.GenerateShareWork(jobSeed, false);
                             Array.Copy(nonce, 0, shareWork, 39, nonce.Length);
 
-                            Statics.BlocksPendingSubmition.Add(new PoolBlock(shareWork, worker.CurrentBlock, "",
-                                                                             Statics.ConnectedClients[guid].Address));
+                            Program.BlocksPendingSubmition.Add(new PoolBlock(shareWork, worker.CurrentBlock, "",
+                                Program.ConnectedClients[guid].Address));
                         }
+
+                        // Set a status
                         result["status"] = "OK";
                     }
                     else
                     {
-                        result["status"] = "Share failed valdiation!";
+                        // Mark share as failed.
+                        result["status"] = "Invalid share.";
+
+                        // Keep track of the failed share count.
                         worker.RejectedShares++;
-                        if ((double) worker.RejectedShares/worker.TotalShares >
-                            int.Parse(Statics.Config.IniReadValue("ban-reject-percentage")) &&
-                            worker.TotalShares > int.Parse(Statics.Config.IniReadValue("ban-after-shares")))
+
+                        // Check to see if we should ban.
+                        if ((double) worker.RejectedShares / worker.TotalShares >
+                            int.Parse(Program.Configuration.IniReadValue("ban-reject-percentage")) &&
+                            worker.TotalShares > int.Parse(Program.Configuration.IniReadValue("ban-after-shares")))
                         {
-                            result["status"] = "You're banished!";
-                            int minutes = int.Parse(Statics.Config.IniReadValue("ban-time-minutes"));
+                            // we're going to ban the miner.
+                            result["status"] = "Address banned for high rejected share rate.";
+
+                            // Get the interval of which the miner will be banned.
+                            var minutes = int.Parse(Program.Configuration.IniReadValue("ban-time-minutes"));
+
+                            // Log to the console that the address was banned.
                             Logger.Log(Logger.LogLevel.General,
-                                       "Client with address {0} ip {1} banned for {2} minutes for having a reject rate of {3}",
-                                       worker.Address, ipAddress, minutes,
-                                       (double) worker.RejectedShares/worker.TotalShares);
-                            Ban ban = new Ban();
-                            ban.AddressBan = worker.Address;
-                            ban.IpBan = ipAddress;
-                            ban.Begin = DateTime.Now;
-                            ban.Minutes = minutes;
-                            Statics.RedisDb.SaveChanges(ban);
+                                "Client {0} ip banned for {1} minutes for having a reject rate of {2}",
+                                ipAddress,
+                                minutes,
+                                (worker.RejectedShares / worker.TotalShares)
+                            );
+
+
+                            // Append the ban to the database
+                            Program.RedisPoolDatabase.SaveChanges(
+                                new Ban
+                                {
+                                    AddressBan = worker.Address,
+                                    IpBan = ipAddress,
+                                    Begin = DateTime.Now,
+                                    Minutes = minutes
+                                }
+                            );
+
+                            // Return the result to the packet.
                             response["result"] = result;
                             return true;
-
                         }
                     }
-
                 }
             }
             catch
             {
                 result["error"] = "Invalid job id";
             }
+
             response["result"] = result;
 
             return false;
         }
 
+        /// <summary>
+        /// Build the job assignment packet.
+        /// </summary>
+        /// <param name="response"></param>
+        /// <param name="guid"></param>
         public static void GenerateGetJobResponse(ref JObject response, string guid)
         {
-            JObject job = new JObject();
+            var job = new JObject();
 
-            ConnectedWorker worker = Statics.ConnectedClients.First(x => x.Key == guid).Value;
+            var worker = Statics.ConnectedClients.First(x => x.Key == guid).Value;
             worker.LastSeen = DateTime.Now;
             /*if (worker.ShareDifficulty.Count >= 4)
                 worker.LastDifficulty = Helpers.WorkerVardiffDifficulty(worker);  */
@@ -268,50 +318,59 @@ namespace MoneroPool
 
             //result["id"] = guid;
 
-            int seed = 0;
+            var seed = 0;
             if (worker.PendingDifficulty != worker.LastDifficulty || worker.CurrentBlock != Statics.CurrentBlockHeight)
             {
-                worker.CurrentBlock = Statics.CurrentBlockHeight;
+                // Tell the worker the current block height
+                worker.CurrentBlock = Program.CurrentBlockHeight;
                 worker.LastDifficulty = worker.PendingDifficulty;
                 job["blob"] = Helpers.GenerateUniqueWork(ref seed);
 
+                // Assign the job 
                 job["job_id"] = Guid.NewGuid().ToString();
-                ShareJob shareJob = new ShareJob();
+                var shareJob = new ShareJob();
                 shareJob.CurrentDifficulty = worker.LastDifficulty;
                 shareJob.Seed = seed;
                 worker.JobSeed.Add(new KeyValuePair<string, ShareJob>((string) job["job_id"], shareJob));
 
 
-                if (worker.JobSeed.Count > int.Parse(Statics.Config.IniReadValue("max-concurrent-works")))
+                // Assign the miner the number of concurrent jobs.
+                if (worker.JobSeed.Count > int.Parse(Program.Configuration.IniReadValue("max-concurrent-works")))
+                {
                     worker.JobSeed.RemoveAt(0);
+                }   
 
-                job["target"] =
-                    BitConverter.ToString(
-                        BitConverter.GetBytes(Helpers.GetTargetFromDifficulty((uint) shareJob.CurrentDifficulty)))
-                                .Replace("-", "");
-
+                // Add the tareget difficulty.
+                job["target"] = BitConverter.ToString(
+                    BitConverter.GetBytes(
+                        Helpers.GetTargetFromDifficulty((uint) shareJob.CurrentDifficulty)
+                    )
+                ).Replace("-", "");
             }
             else
             {
+                // Send empty data.
                 job["blob"] = "";
                 job["job_id"] = "";
                 job["target"] = "";
             }
+
+            // Assign the job signal to the result.
             response["result"] = job;
 
-            MinerWorker minerWorker = Statics.RedisDb.MinerWorkers.First(x => x.Identifier == guid);
+            // Get the first worker
+            var minerWorker = Program.RedisPoolDatabase.MinerWorkers.First(x => x.Identifier == guid);
             minerWorker.NewJobRequest();
-            Statics.RedisDb.SaveChanges(minerWorker);
-            Statics.ConnectedClients[guid] = worker;
-            Logger.Log(Logger.LogLevel.Verbose, "Finsihed getjob response");
+            Program.RedisPoolDatabase.SaveChanges(minerWorker);
+            Program.ConnectedClients[guid] = worker;
 
+            Logger.Log(Logger.LogLevel.Verbose, "Finsihed job response");
         }
 
         public void GenerateLoginResponse(ref JObject response, string guid, string address)
         {
-
-            JObject result = new JObject();
-            JObject job = new JObject();
+            var result = new JObject();
+            var job = new JObject();
 
             if (!Helpers.IsValidAddress(address, uint.Parse(Statics.Config.IniReadValue("base58-prefix"))))
             {
@@ -319,7 +378,7 @@ namespace MoneroPool
                 return;
             }
 
-            ConnectedWorker worker = new ConnectedWorker();
+            var worker = new ConnectedWorker();
             worker.Address = address;
             worker.LastSeen = DateTime.Now;
             worker.LastDifficulty = uint.Parse(Statics.Config.IniReadValue("base-difficulty"));
@@ -329,21 +388,21 @@ namespace MoneroPool
 
             result["id"] = guid;
 
-            int seed = 0;
+            var seed = 0;
 
             job["blob"] = Helpers.GenerateUniqueWork(ref seed);
 
             job["job_id"] = Guid.NewGuid().ToString();
 
-            ShareJob shareJob = new ShareJob();
+            var shareJob = new ShareJob();
             shareJob.CurrentDifficulty = worker.LastDifficulty;
             shareJob.Seed = seed;
             worker.JobSeed.Add(new KeyValuePair<string, ShareJob>((string) job["job_id"], shareJob));
 
             job["target"] =
                 BitConverter.ToString(
-                    BitConverter.GetBytes(Helpers.GetTargetFromDifficulty((uint) shareJob.CurrentDifficulty)))
-                            .Replace("-", "");
+                        BitConverter.GetBytes(Helpers.GetTargetFromDifficulty((uint) shareJob.CurrentDifficulty)))
+                    .Replace("-", "");
 
             Logger.Log(Logger.LogLevel.General, "Sending new work with target {0}", (string) job["target"]);
 
@@ -354,40 +413,40 @@ namespace MoneroPool
 
             worker.NewJobRequest();
 
-            Statics.ConnectedClients.Add(guid, worker);
+            Program..ConnectedClients.Add(guid, worker);
 
-            //Initialize new client in DB
-            if (Statics.RedisDb.Miners.Any(x => x.Address == worker.Address))
+            // Add a new client in the database.
+            if (Program.RedisPoolDatabase.Miners.Any(x => x.Address == worker.Address))
             {
-                Miner miner = Statics.RedisDb.Miners.First(x => x.Address == worker.Address);
-                MinerWorker minerWorker = new MinerWorker(guid, miner.Identifier, 0);
+                var miner = Program.RedisPoolDatabase.Miners.First(x => x.Address == worker.Address);
+                var minerWorker = new MinerWorker(guid, miner.Identifier, 0);
                 minerWorker.NewJobRequest();
                 miner.MinersWorker.Add(guid);
-                Statics.RedisDb.SaveChanges(miner);
-                Statics.RedisDb.SaveChanges(minerWorker);
+                Program.RedisPoolDatabase.SaveChanges(miner);
+                Program.RedisPoolDatabase.SaveChanges(minerWorker);
             }
             else
             {
-                Miner miner = new Miner(worker.Address, 0);
-                MinerWorker minerWorker = new MinerWorker(guid, miner.Identifier, 0);
+                var miner = new Miner(worker.Address, 0);
+                var minerWorker = new MinerWorker(guid, miner.Identifier, 0);
                 minerWorker.NewJobRequest();
                 miner.MinersWorker.Add(guid);
-                Statics.RedisDb.SaveChanges(miner);
-                Statics.RedisDb.SaveChanges(minerWorker);
+                Program.RedisPoolDatabase.SaveChanges(miner);
+                Program.RedisPoolDatabase.SaveChanges(minerWorker);
             }
-            Logger.Log(Logger.LogLevel.Verbose, "Finished login response");
 
+            Logger.Log(Logger.LogLevel.Verbose, "Finished login response");
         }
 
         public async void AcceptTcpClient(TcpClient client)
         {
             while (true)
             {
-                string sRequest = "";
-                bool abort = false;
+                var sRequest = "";
+                var abort = false;
                 while (client.GetStream().DataAvailable)
                 {
-                    byte[] b = new byte[1];
+                    var b = new byte[1];
                     await client.GetStream().ReadAsync(b, 0, 1);
                     abort = true;
                     if (b[0] == 0x0a)
@@ -395,50 +454,62 @@ namespace MoneroPool
                         abort = false;
                         break;
                     }
-                    sRequest += ASCIIEncoding.ASCII.GetString(b);
-                    if (sRequest.Length > 1024*10 || (sRequest.Length - sRequest.Trim().Length) > 128)
+
+                    sRequest += Encoding.ASCII.GetString(b);
+                    if (sRequest.Length > 1024 * 10 || sRequest.Length - sRequest.Trim().Length > 128)
                         break;
                 }
+
                 if (abort)
                 {
                     client.Close();
                     break;
                 }
-                if(sRequest == "")
+
+                if (sRequest == "")
                     continue;
-                string guid = "";
-                string s = AcceptClient(sRequest, ((IPEndPoint) client.Client.RemoteEndPoint).Address.ToString(),
-                                        ref abort, ref guid);
+                var guid = "";
+                var s = AcceptClient(sRequest, ((IPEndPoint) client.Client.RemoteEndPoint).Address.ToString(),
+                    ref abort, ref guid);
+
+                // Abort signal, close the socket.
                 if (abort)
                 {
                     client.Close();
                     break;
                 }
+
+                // Append newline character
                 s += "\n";
-                byte[] byteArray = Encoding.UTF8.GetBytes(s);
+
+                // Convert to bytes
+                var byteArray = Encoding.UTF8.GetBytes(s);
+
+                // Asyncronously write to the miner.
                 await client.GetStream().WriteAsync(byteArray, 0, byteArray.Length);
 
-                if (Statics.ConnectedClients[guid].TcpClient == null)
-                    Statics.ConnectedClients[guid].TcpClient = client;
-
+                // Add current miner to list.
+                if (Program.ConnectedClients[guid].TcpClient == null)
+                {
+                    Program.ConnectedClients[guid].TcpClient = client;
+                }
             }
         }
 
 
         public async void AcceptHttpClient(
-            Mono.Net.HttpListenerContext client)
+            HttpListenerContext client)
         {
-
-            string sRequest = Helpers.GetRequestBody(client.Request);
+            var sRequest = Helpers.GetRequestBody(client.Request);
             //sRequest = Helpers.GetRequestBody(client.Request);
             if (sRequest == "")
                 return;
 
-            bool close = false;
+            var close = false;
 
-            string guid = "";
-            string s = AcceptClient(sRequest, client.Request.UserHostAddress, ref close, ref guid);
-            byte[] byteArray = Encoding.UTF8.GetBytes(s);
+            var guid = "";
+            var s = AcceptClient(sRequest, client.Request.UserHostAddress, ref close, ref guid);
+            var byteArray = Encoding.UTF8.GetBytes(s);
 
             client.Response.ContentType = "application/json";
 
@@ -451,10 +522,10 @@ namespace MoneroPool
              } */
             //client.
             client.Response.OutputStream.Close();
-          //  if (close)
-                client.Response.Close();
+            //  if (close)
+            client.Response.Close();
 
-            if(close)
+            if (close)
                 client.Request.InputStream.Dispose();
         }
 
@@ -462,18 +533,18 @@ namespace MoneroPool
         {
             try
             {
-              
-                JObject request = JObject.Parse(sRequest);
-                JObject response = new JObject();
+                var request = JObject.Parse(sRequest);
+                var response = new JObject
+                {
+                    ["id"] = 0,
+                    ["jsonrpc"] = "2.0",
+                    ["error"] = null
+                };
 
-                response["id"] = 0;
-                response["jsonrpc"] = "2.0";
 
-                response["error"] = null;
                 if ((string) request["method"] == "login")
                 {
                     guid = Guid.NewGuid().ToString();
-                    
                 }
 
                 else
@@ -485,8 +556,8 @@ namespace MoneroPool
                         response["error"] = "Not authenticated yet!";
                         return JsonConvert.SerializeObject(response);
                     }
-
                 }
+
                 switch ((string) request["method"])
                 {
                     case "login":
@@ -496,15 +567,15 @@ namespace MoneroPool
                         GenerateGetJobResponse(ref response, guid);
                         break;
                     case "submit":
-                        abort = GenerateSubmitResponse(ref response, (string)request["params"]["job_id"], guid,
-                                                       Helpers.StringToByteArray((string) request["params"]["nonce"]),
-                                                       (string) request["params"]["result"], ipAddress);
+                        abort = GenerateSubmitResponse(ref response, (string) request["params"]["job_id"], guid,
+                            Helpers.StringToByteArray((string) request["params"]["nonce"]),
+                            (string) request["params"]["result"], ipAddress);
                         break;
                 }
 
                 return JsonConvert.SerializeObject(response);
             }
-            
+
             catch (Exception e)
             {
                 Logger.Log(Logger.LogLevel.Error, e.ToString());

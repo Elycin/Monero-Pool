@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Net.Sockets;
 
 namespace MoneroPool
 {
@@ -10,41 +8,50 @@ namespace MoneroPool
     {
         public int Seed;
         private ulong _currentDifficulty;
+
         public ulong CurrentDifficulty
         {
-            get
-            {
-                return _currentDifficulty;
-            }
+            get => _currentDifficulty;
             set
             {
-                if (value > (uint)Statics.CurrentBlockTemplate["difficulty"])
-                    value = (uint)Statics.CurrentBlockTemplate["difficulty"];
+                if (value > (uint) Statics.CurrentBlockTemplate["difficulty"])
+                    value = (uint) Statics.CurrentBlockTemplate["difficulty"];
                 if (value <= uint.Parse(Statics.Config.IniReadValue("base-difficulty")))
                     value = uint.Parse(Statics.Config.IniReadValue("base-difficulty"));
                 _currentDifficulty = value;
             }
         }
-        private List<int> _submittedShares; 
+
+        private List<int> _submittedShares;
 
         public List<int> SubmittedShares
         {
             get
             {
-                if(_submittedShares==null)
+                if (_submittedShares == null)
                     _submittedShares = new List<int>();
                 return _submittedShares;
             }
-        } 
+        }
     }
+
     public class ConnectedWorker
     {
+        private DateTime _lastjoborshare;
+        private DateTime _share;
+
+        public ConnectedWorker()
+        {
+            JobSeed = new List<KeyValuePair<string, ShareJob>>();
+            ShareDifficulty = new List<KeyValuePair<TimeSpan, ulong>>();
+        }
+
         public string Address { get; set; }
         public DateTime LastSeen { get; set; }
-        public List<KeyValuePair<TimeSpan,ulong>> ShareDifficulty { get; private set; }
+        public List<KeyValuePair<TimeSpan, ulong>> ShareDifficulty { get; }
         public DateTime LastShare { get; set; }
 
-        public System.Net.Sockets.TcpClient TcpClient { get; set; }
+        public TcpClient TcpClient { get; set; }
 
         public List<KeyValuePair<string, ShareJob>> JobSeed { get; set; }
         public int CurrentBlock { get; set; }
@@ -54,15 +61,6 @@ namespace MoneroPool
 
         public uint LastDifficulty { get; set; }
         public uint PendingDifficulty { get; set; }
-
-        private DateTime _lastjoborshare;
-        private DateTime _share;
-
-        public ConnectedWorker()
-        {
-            JobSeed = new List<KeyValuePair<string, ShareJob>>();
-            ShareDifficulty = new List<KeyValuePair<TimeSpan, ulong>>();
-        }
 
 
         public void NewJobRequest()

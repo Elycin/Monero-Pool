@@ -1,138 +1,102 @@
 ﻿using System;
-using System.CodeDom.Compiler;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Net;
-using System.Net.Sockets;
-using System.Security.Policy;
-using System.Text;
 using System.Threading;
-using System.Numerics;
-using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using System.Threading.Tasks;
 using StackExchange.Redis;
-
 
 namespace MoneroPool
 {
     internal class Program
     {
-        private static IniFile config = new IniFile("config.txt");
+        // Public classes to application
+        public static Configuration Configuration;
+        public static ConfigurationOptions RedisConfigurationOptions;
+        public static volatile uint TotalShares;
+        public static volatile StaticsLock Lock;
+        public static volatile JObject CurrentBlockTemplate;
+        public static volatile int CurrentBlockHeight;
+        public static volatile int ReserveSeed;
+        public static volatile JsonRPC DaemonJson;
+        public static volatile JsonRPC WalletJson;
+        public static volatile List<PoolBlock> BlocksPendingSubmition;
+        public static volatile List<PoolBlock> BlocksPendingPayment;
+        public static volatile Dictionary<string, ConnectedWorker> ConnectedClients =
+            new Dictionary<string, ConnectedWorker>();
+        public static volatile RedisPoolDatabase RedisPoolDatabase;
+        public static volatile PoolHashRateCalculation HashRate;
 
+        /// <summary>
+        /// Application Entry Point.
+        /// </summary>
+        /// <param name="args"></param>
         private static void Main(string[] args)
         {
-            ConfigurationOptions configR = new ConfigurationOptions();
-            configR.ResolveDns = true;
+            // Get a new global configuration instance.
+            Configuration = new Configuration();
 
-            string host = config.IniReadValue("redis-server");
-            int port = 6379;
-
-            if (host.Split(':').Length == 2)
-                port = int.Parse(host.Split(':')[1]);
-
-            host = host.Split(':')[0];
-
-            configR.EndPoints.Add(Dns.GetHostAddresses(host)[0], port);
-
-            Logger.AppLogLevel = Logger.LogLevel.Debug;
-            Logger.Log(Logger.LogLevel.General, "Starting up!");
-
-            Statics.HashRate = new PoolHashRateCalculation();
-
-            Logger.Log(Logger.LogLevel.Debug, "Initialized PoolHashRateCalculation");
-            try
+            // Initialize redis configuration
+            RedisConfigurationOptions = new ConfigurationOptions
             {
+                ResolveDns = true
+            };
 
-                Statics.RedisDb =
-                    new RedisPoolDatabase(
-                        ConnectionMultiplexer.Connect(configR)
-                                             .GetDatabase(int.Parse(config.IniReadValue("redis-database"))));
-                Logger.Log(Logger.LogLevel.Debug, "Initialized RedisDb");
+            // Add redis connection.
+            RedisConfigurationOptions.EndPoints.Add(
+                Configuration.GetRedisAddress(),
+                Configuration.GetRedisPort()
+            );
 
-            }
-            catch (StackExchange.Redis.RedisConnectionException)
-            {
-                if (NativeFunctions.IsLinux)
-                {
-                    Logger.Log(Logger.LogLevel.Error, "Redis connection failed.Retrying after 3 seconds");
-                    Thread.Sleep(3*1000);
-                    while (true)
-                    {
-                        try
-                        {
-                            Statics.RedisDb =
-                                new RedisPoolDatabase(
-                                    ConnectionMultiplexer.Connect(configR)
-                                                         .GetDatabase(int.Parse(config.IniReadValue("redis-database"))));
-                            break;
-                        }
-                        catch
-                        {
-                        }
-                        Logger.Log(Logger.LogLevel.Error, "Redis connection failed.Retrying after 3 seconds");
-                        Thread.Sleep(3*1000);
-                    }
-                }
-                else
-                {
-                    Logger.Log(Logger.LogLevel.Error, "Redis connection failed. Shutting down");
-                    Environment.Exit(-1);
-                }
-            }
-            Statics.BlocksPendingPayment = new List<PoolBlock>();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized BlocksPendingPayment");
+            // Initialize Redis Connection.
+            InitializeRedis();
 
-            Statics.BlocksPendingSubmition = new List<PoolBlock>();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized BlocksPendingSubmition");
+            // Initialize Block Objects.
+            HashRate = new PoolHashRateCalculation();
+            BlocksPendingPayment = new List<PoolBlock>();
+            BlocksPendingSubmition = new List<PoolBlock>();
+            ConnectedClients = new Dictionary<string, ConnectedWorker>();
+            DaemonJson = new JsonRPC(Configuration.GetDaemonRpc());
+            WalletJson = new JsonRPC(Configuration.GetWalletRpc());
 
-            Statics.Config = new IniFile("config.txt");
-            Logger.Log(Logger.LogLevel.Debug, "Initialized Config");
+            // Create local instances to keep classes in memory.
+            var backgroundSaticUpdater = new BackgroundStaticUpdater();
+            var blockPayment = new BlockPayment();
+            var blockSubmitter = new BlockSubmitter();
+            var difficultyRetargeter = new DifficultyRetargeter();
+            var cryptoNightPool = new CryptoNightPool();
 
-            Statics.ConnectedClients = new Dictionary<string, ConnectedWorker>();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized ConnectedClients");
-
-            Statics.DaemonJson = new JsonRPC(config.IniReadValue("daemon-json-rpc"));
-            Logger.Log(Logger.LogLevel.Debug, "Initialized DaemonJson");
-
-            Statics.WalletJson = new JsonRPC(config.IniReadValue("wallet-json-rpc"));
-            Logger.Log(Logger.LogLevel.Debug, "Initialized WalletJson");
-
-            Logger.Log(Logger.LogLevel.General, "Initialized Statics, initializing classes");
-
-
-
-            BackgroundStaticUpdater backgroundSaticUpdater = new BackgroundStaticUpdater();
+            // Start routines.
             backgroundSaticUpdater.Start();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized backgroundSaticUpdater");
-
-            BlockPayment blockPayment = new BlockPayment();
             blockPayment.Start();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized BlockPayment");
-
-            BlockSubmitter blockSubmitter = new BlockSubmitter();
             blockSubmitter.Start();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized BlockSubmitter");
-
-            DifficultyRetargeter difficultyRetargeter = new DifficultyRetargeter();
             difficultyRetargeter.Start();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized DifficultyRetargeter");
-
-
-            CryptoNightPool cryptoNightPool = new CryptoNightPool();
             cryptoNightPool.Start();
-            Logger.Log(Logger.LogLevel.Debug, "Initialized CryptoNightPool");
 
-            Logger.Log(Logger.LogLevel.General, "Initialized Classes");
 
+            // Pointless loop to keep the application running.
             while (true)
             {
-                Logger.Log(Logger.LogLevel.Debug, "Put the main thread into sleep...");
                 Thread.Sleep(Timeout.Infinite);
-
             }
+        }
 
+        /// <summary>
+        /// Initialize the redis database connection.
+        /// </summary>
+        public static void InitializeRedis()
+        {
+            try
+            {
+                RedisPoolDatabase = new RedisPoolDatabase(
+                    ConnectionMultiplexer.Connect(RedisConfigurationOptions)
+                        .GetDatabase(Configuration.GetRedisDatabase())
+                );
+            }
+            catch (RedisConnectionException)
+            {
+                Logger.Log(Logger.LogLevel.Error, "Redis connection failed.");
+                Environment.Exit(0);
+            }
         }
     }
 }
